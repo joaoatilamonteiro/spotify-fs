@@ -3,28 +3,57 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
-	"strings"
-
 	"log"
+	mathRand "math/rand/v2"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
+	"golang.org/x/crypto/pbkdf2"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/spotify"
 )
 
-const ServerPort = ":8080"
-const Charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-const LengthRNGString = 3
-const SpotifyMaxTracksPerRequest = 100
+const (
+	ServerPort                 = ":8080"
+	Charset                    = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	LengthRNGString            = 5
+	SpotifyMaxTracksPerRequest = 100
+	numWorkers                 = 4
+	saltSize                   = 16
+	keySize                    = 32
+	pbkdfIterations            = 100000
+	RateLimitWaitTime          = 5
+	maxBytesPerPlaylist        = 10000
+)
+
+type WriteJob struct {
+	PlaylistID string
+	Chunks     [][]byte
+}
+
+type ReadJob struct {
+	Sequence   int
+	PlaylistID string
+}
+
+type ReadResult struct {
+	Sequence int
+	Data     []byte
+	NextID   string
+}
 
 type AuthSpotify struct {
 	Config   *oauth2.Config
@@ -48,8 +77,9 @@ type WebClient struct {
 	SpotifySearchURL      string
 	SpotifyUserURL        string
 	CreatePlaylistURL     string
-	AddPlaylistURL        string
+	PlaylistURL           string
 	ChangePlaylistDetails string
+	GetPlaylist           string
 }
 
 type SpotifySearchResponse struct {
@@ -65,9 +95,18 @@ type SpotifyItem struct {
 }
 
 type PlaylistInfo struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Public      bool   `json:"public"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	Public      *bool  `json:"public,omitempty"`
+}
+
+type PlaylistItems struct {
+	Next  string `json:"next"`
+	Items []struct {
+		Track struct {
+			Uri string `json:"uri"`
+		} `json:"track"`
+	} `json:"items"`
 }
 
 type ErrorDetail struct {
@@ -95,8 +134,96 @@ func (a *AuthSpotify) generateSpotifyAuthLink() {
 
 	a.Verifier = oauth2.GenerateVerifier()
 	url := a.Config.AuthCodeURL("state", oauth2.AccessTypeOffline, oauth2.S256ChallengeOption(a.Verifier))
-	fmt.Printf("Visit the URL for the auth dialog: %v", url)
+	fmt.Printf("Visit the URL for the auth dialog: %v\n", url)
 
+}
+
+func saveMap(path string, m map[string]byte, password string) error {
+	var gobBuffer bytes.Buffer
+	if err := gob.NewEncoder(&gobBuffer).Encode(m); err != nil {
+		return err
+	}
+	plaintext := gobBuffer.Bytes()
+
+	salt := make([]byte, saltSize)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return err
+	}
+
+	key := pbkdf2.Key([]byte(password), salt, pbkdfIterations, keySize, sha256.New)
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	io.ReadFull(rand.Reader, nonce)
+
+	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
+
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	file.Write(salt)
+	file.Write(nonce)
+	file.Write(ciphertext)
+
+	return nil
+
+}
+
+func loadMap(path, password string) (map[string]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	block, err := aes.NewCipher(make([]byte, keySize))
+	if err != nil {
+		return nil, err
+	}
+	gcmTemp, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonceSize := gcmTemp.NonceSize()
+
+	if len(data) < saltSize+nonceSize {
+		return nil, errors.New("corrupted or too short file")
+	}
+
+	salt := data[:saltSize]
+	nonce := data[saltSize : saltSize+nonceSize]
+	ciphertext := data[saltSize+nonceSize:]
+
+	key := pbkdf2.Key([]byte(password), salt, pbkdfIterations, keySize, sha256.New)
+
+	block, err = aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, errors.New("Decryption failed: incorrect password or altered data.")
+	}
+
+	var result map[string]byte
+	reader := bytes.NewReader(plaintext)
+	err = gob.NewDecoder(reader).Decode(&result)
+
+	return result, err
 }
 
 func (a *AuthSpotify) exchangeToToken(w http.ResponseWriter, r *http.Request) {
@@ -187,21 +314,24 @@ func NewRNGStringWithSeed(length int, hash []byte, modifier uint64) string {
 
 	seed := baseSeed + modifier
 
-	source := rand.NewPCG(seed, 0)
-	r := rand.New(source)
+	source := mathRand.NewPCG(seed, 0)
+	r := mathRand.New(source)
 
-	charset := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	var sb strings.Builder
 	sb.Grow(length)
 
 	for i := 0; i < length; i++ {
-		randomIndex := r.IntN(len(charset))
-		sb.WriteByte(charset[randomIndex])
+		randomIndex := r.IntN(len(Charset))
+		sb.WriteByte(Charset[randomIndex])
 	}
 	return sb.String()
 }
 
-func (s *SpotifyClient) NewDictionary(ctx context.Context, hash []byte) (map[byte]string, map[string]byte, error) {
+func (s *SpotifyClient) NewDictionary(ctx context.Context, password string) (map[byte]string, map[string]byte, error) {
+	h := sha256.New()
+	h.Write([]byte(password))
+	hash := h.Sum(nil)
+
 	foundCount := 0
 	byteCount := byte(0)
 	seedDiff := uint64(0)
@@ -255,6 +385,12 @@ func (s *SpotifyClient) NewDictionary(ctx context.Context, hash []byte) (map[byt
 			}
 
 			if len(response.Tracks.Items) > 0 {
+
+				if _, alreadyExists := readerDictionary[response.Tracks.Items[0].URI]; alreadyExists {
+					log.Printf("Collision detected for track %s. Trying another one...", response.Tracks.Items[0].URI)
+					return nil
+				}
+
 				writerDictionary[byteCount] = response.Tracks.Items[0].URI
 				readerDictionary[response.Tracks.Items[0].URI] = byteCount
 				byteCount++
@@ -263,7 +399,7 @@ func (s *SpotifyClient) NewDictionary(ctx context.Context, hash []byte) (map[byt
 
 			return nil
 		}()
-		log.Printf("Music %d/255\n", foundCount)
+		log.Printf("Track %d/256\n", foundCount)
 
 		seedDiff++
 
@@ -276,6 +412,7 @@ func (s *SpotifyClient) NewDictionary(ctx context.Context, hash []byte) (map[byt
 }
 
 func (s *SpotifyClient) EditPlaylistDescription(ctx context.Context, newPlaylistID, oldPlaylistID string) error {
+	RateLimitMultiplier := 1
 	playlistInfo := PlaylistInfo{
 		Description: newPlaylistID,
 	}
@@ -284,97 +421,129 @@ func (s *SpotifyClient) EditPlaylistDescription(ctx context.Context, newPlaylist
 		return fmt.Errorf("Error marshaling struct: %w", err)
 	}
 
-	requestBody := bytes.NewBuffer(jsonData)
+	for {
+		requestBody := bytes.NewBuffer(jsonData)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, fmt.Sprintf(s.WebConfig.ChangePlaylistDetails, oldPlaylistID), requestBody)
-	if err != nil {
-		return fmt.Errorf("Error creating the request: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+s.Auth.Token.AccessToken)
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.WebConfig.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("Error while doing request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode > 299 || resp.StatusCode < 200 {
-
-		var errResp ErrorResponse
-
-		err := json.NewDecoder(resp.Body).Decode(&errResp)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, fmt.Sprintf(s.WebConfig.ChangePlaylistDetails, oldPlaylistID), requestBody)
 		if err != nil {
-			return fmt.Errorf("Error decoding JSON error: %w", err)
+			return fmt.Errorf("Error creating the request: %w", err)
 		}
 
-		return fmt.Errorf("Error editing playlist (%d): %s", errResp.Error.Status, errResp.Error.Message)
-	}
+		req.Header.Set("Authorization", "Bearer "+s.Auth.Token.AccessToken)
 
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := s.WebConfig.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("Error while doing request: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode > 299 || resp.StatusCode < 200 {
+			if resp.StatusCode == 429 {
+				rateLimitTime := RateLimitWaitTime * RateLimitMultiplier
+				log.Printf("Error while adding to playlist (Rate limit). Trying again in %d seconds...", rateLimitTime)
+				time.Sleep(time.Duration(rateLimitTime) * time.Second)
+				RateLimitMultiplier++
+				continue
+			}
+
+			if resp.StatusCode == 502 {
+				log.Printf("Error while adding to playlist. Trying again in %d seconds...", 1)
+				time.Sleep(1 * time.Second)
+				RateLimitMultiplier++
+				continue
+			}
+
+			var errResp ErrorResponse
+
+			err := json.NewDecoder(resp.Body).Decode(&errResp)
+			if err != nil {
+				return fmt.Errorf("Error decoding JSON error: %w", err)
+			}
+
+			return fmt.Errorf("Error editing playlist (%d): %s", errResp.Error.Status, errResp.Error.Message)
+		}
+		break
+	}
 	return nil
+
 }
 
 func (s *SpotifyClient) CreatePlaylist(ctx context.Context, playlistInfo PlaylistInfo, oldPlaylistID string, playListCount int) (string, error) {
+	RateLimitMultiplier := 1
 	if playListCount > 0 {
 		playlistInfo.Name = fmt.Sprintf("%s%d", playlistInfo.Name, playListCount)
-
 	}
 	jsonData, err := json.Marshal(playlistInfo)
 	if err != nil {
 		return "", fmt.Errorf("Error marshaling struct: %w", err)
 	}
 
-	requestBody := bytes.NewBuffer(jsonData)
+	for {
+		requestBody := bytes.NewBuffer(jsonData)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf(s.WebConfig.CreatePlaylistURL, s.ClientID), requestBody)
-	if err != nil {
-
-		return "", fmt.Errorf("Error creating the request: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+s.Auth.Token.AccessToken)
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.WebConfig.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("Error while doing request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-
-		var errResp ErrorResponse
-		log.Println("Error")
-		err := json.NewDecoder(resp.Body).Decode(&errResp)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf(s.WebConfig.CreatePlaylistURL, s.ClientID), requestBody)
 		if err != nil {
+
+			return "", fmt.Errorf("Error creating the request: %w", err)
+		}
+
+		req.Header.Set("Authorization", "Bearer "+s.Auth.Token.AccessToken)
+
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := s.WebConfig.client.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("Error while doing request: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+			if resp.StatusCode == 429 {
+				rateLimitTime := RateLimitWaitTime * RateLimitMultiplier
+				log.Printf("Error while adding to playlist (Rate limit). Trying again in %d seconds...", rateLimitTime)
+				time.Sleep(time.Duration(rateLimitTime) * time.Second)
+				RateLimitMultiplier++
+				continue
+			}
+
+			if resp.StatusCode == 502 {
+				log.Printf("Error while adding to playlist. Trying again in %d seconds...", 1)
+				time.Sleep(1 * time.Second)
+				RateLimitMultiplier++
+				continue
+			}
+
+			var errResp ErrorResponse
+			err := json.NewDecoder(resp.Body).Decode(&errResp)
+			if err != nil {
+				return "", fmt.Errorf("Error decoding JSON error: %w", err)
+			}
+
+			return "", fmt.Errorf("Error creating playlist (%d): %s", errResp.Error.Status, errResp.Error.Message)
+		}
+		var SpotifyID SpotifyPlaylistID
+		err = json.NewDecoder(resp.Body).Decode(&SpotifyID)
+		if err != nil {
+			log.Println("Error retrieving Spotify ID")
 			return "", fmt.Errorf("Error decoding JSON error: %w", err)
 		}
 
-		return "", fmt.Errorf("Error creating playlist (%d): %s", errResp.Error.Status, errResp.Error.Message)
-	}
-	var SpotifyID SpotifyPlaylistID
-	err = json.NewDecoder(resp.Body).Decode(&SpotifyID)
-	if err != nil {
-		log.Println("Error spotify ID")
-		return "", fmt.Errorf("Error decoding JSON error: %w", err)
-	}
+		log.Println("Playlist Created")
+		if playListCount > 0 {
+			if oldPlaylistID == "" {
+				return "", fmt.Errorf("Old Playlist ID is NULL")
+			}
+			err = s.EditPlaylistDescription(ctx, SpotifyID.ID, oldPlaylistID)
+			if err != nil {
+				return "", err
+			}
 
-	log.Println("Playlist Criada")
-	if playListCount > 0 {
-		if oldPlaylistID == "" {
-			return "", fmt.Errorf("Old Playlist ID is NULL")
 		}
-		err = s.EditPlaylistDescription(ctx, SpotifyID.ID, oldPlaylistID)
-		if err != nil {
-			return "", err
-		}
-
+		return SpotifyID.ID, nil
 	}
 
-	return SpotifyID.ID, nil
 }
 
 func (s *SpotifyClient) AddToPlaylist(ctx context.Context, musicURIS SpotifyAddPlaylist, playlistID string) error {
@@ -384,40 +553,94 @@ func (s *SpotifyClient) AddToPlaylist(ctx context.Context, musicURIS SpotifyAddP
 		return fmt.Errorf("Error While marshaling: %s", err)
 	}
 
-	requestBody := bytes.NewBuffer(jsonData)
+	RateLimitMultiplier := 1
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf(s.WebConfig.AddPlaylistURL, playlistID), requestBody)
-	if err != nil {
-		return fmt.Errorf("Error while creating request: %s", err)
-	}
+	for {
+		requestBody := bytes.NewBuffer(jsonData)
 
-	req.Header.Set("Authorization", "Bearer "+s.Auth.Token.AccessToken)
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.WebConfig.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("Error while requesting: %s", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode > 300 {
-		var errResp ErrorResponse
-		err = json.NewDecoder(resp.Body).Decode(&errResp)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf(s.WebConfig.PlaylistURL, playlistID), requestBody)
 		if err != nil {
-			return fmt.Errorf("Error decoding JSON error: %s", err)
+			return fmt.Errorf("Error while creating request: %s", err)
 		}
-		return fmt.Errorf("Error to add music to playlist `%s` (%d): %s", playlistID, errResp.Error.Status, errResp.Error.Message)
+
+		req.Header.Set("Authorization", "Bearer "+s.Auth.Token.AccessToken)
+
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := s.WebConfig.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("Error while requesting: %s", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode < 200 || resp.StatusCode > 300 {
+			if resp.StatusCode == 429 {
+				rateLimitTime := RateLimitWaitTime * RateLimitMultiplier
+				log.Printf("Error while adding to playlist (Rate limit). Trying again in %d seconds...", rateLimitTime)
+				time.Sleep(time.Duration(rateLimitTime) * time.Second)
+				RateLimitMultiplier++
+				continue
+			}
+
+			if resp.StatusCode == 502 {
+				log.Printf("Error while adding to playlist. Trying again in %d seconds...", 1)
+				time.Sleep(1 * time.Second)
+				RateLimitMultiplier++
+				continue
+			}
+			var errResp ErrorResponse
+			err = json.NewDecoder(resp.Body).Decode(&errResp)
+			if err != nil {
+				return fmt.Errorf("Error decoding JSON error: %s", err)
+			}
+			return fmt.Errorf("Error to add music to playlist `%s` (%d): %s", playlistID, errResp.Error.Status, errResp.Error.Message)
+		}
+		break
 	}
 
 	return nil
 }
 
-func (s *SpotifyClient) Writer(filepath string, hash []byte) {
+func (s *SpotifyClient) WriterWorker(ctx context.Context, job <-chan WriteJob, writerdictionary map[byte]string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for j := range job {
+		for i, chunk := range j.Chunks {
+			musicsURI := make([]string, len(chunk))
+			for idx, b := range chunk {
+				musicsURI[idx] = writerdictionary[b]
+			}
+
+			addPlaylistURIS := SpotifyAddPlaylist{
+				MusicURIS: musicsURI,
+			}
+
+			for {
+				err := s.AddToPlaylist(ctx, addPlaylistURIS, j.PlaylistID)
+				if err == nil {
+					break
+				}
+
+				log.Printf("[Worker] Critical error adding chunk %d to playlist %s: %v", i, j.PlaylistID, err)
+				time.Sleep(1 * time.Second)
+			}
+		}
+		fmt.Printf("Successfully finished all chunks for playlist %s\n", j.PlaylistID)
+	}
+}
+
+func (s *SpotifyClient) Writer(filepath string, password string, playlistName string) {
 	ctx := context.Background()
-	writerdictionary, _, err := s.NewDictionary(ctx, hash)
+	writerdictionary, readerdictionary, err := s.NewDictionary(ctx, password)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Printf("Error initializing dictionary: %v\n", err)
+		return
+	}
+
+	fmt.Println("Saving map to file...")
+	decoderFile := playlistName + "_Decoder.gob"
+	if err := saveMap(decoderFile, readerdictionary, password); err != nil {
+		fmt.Printf("Error saving decoder map: %v\n", err)
+		return
 	}
 
 	file, err := os.Open(filepath)
@@ -427,63 +650,258 @@ func (s *SpotifyClient) Writer(filepath string, hash []byte) {
 	}
 	defer file.Close()
 
-	playlistInfo := PlaylistInfo{
-		Name:        "Test",
-		Description: "Test",
-		Public:      true,
+	jobs := make(chan WriteJob, numWorkers)
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		go s.WriterWorker(ctx, jobs, writerdictionary, &wg)
 	}
 
-	playlistID, err := s.CreatePlaylist(ctx, playlistInfo, "", 0)
-	if err != nil {
-		log.Println(err)
-	}
-
-	log.Println("Playlist ID: " + playlistID)
-
-	buf := make([]byte, SpotifyMaxTracksPerRequest)
-	bytesRead := 0
 	playlistCount := 0
+	lastPlaylistID := ""
+	var currentChunks [][]byte
+	bytesInCurrentPlaylist := 0
+	readBuf := make([]byte, SpotifyMaxTracksPerRequest)
+
+	isPublic := true
+	pInfo := PlaylistInfo{
+		Name:   playlistName,
+		Public: &isPublic,
+	}
+
 	for {
-		if bytesRead%10000 == 0 {
-			oldPlaylistID := playlistID
-			playlistCount++
-			playlistID, err = s.CreatePlaylist(ctx, playlistInfo, oldPlaylistID, playlistCount)
-			if err != nil {
-				log.Printf("Error while creating the playlist %d: %s", playlistCount, err)
-				return
-			}
+		n, err := file.Read(readBuf)
+		if n > 0 {
+			chunk := make([]byte, n)
+			copy(chunk, readBuf[:n])
+			currentChunks = append(currentChunks, chunk)
+			bytesInCurrentPlaylist += n
 		}
-		n, err := file.Read(buf)
+
+		if (bytesInCurrentPlaylist >= maxBytesPerPlaylist || err == io.EOF) && len(currentChunks) > 0 {
+			newPlaylistID, createErr := s.CreatePlaylist(ctx, pInfo, lastPlaylistID, playlistCount)
+			if createErr != nil {
+				log.Printf("Failed to create playlist %d: %v", playlistCount, createErr)
+				break
+			}
+
+			jobs <- WriteJob{
+				PlaylistID: newPlaylistID,
+				Chunks:     currentChunks,
+			}
+
+			lastPlaylistID = newPlaylistID
+			currentChunks = nil
+			bytesInCurrentPlaylist = 0
+			playlistCount++
+		}
+
 		if err == io.EOF {
 			break
 		}
+	}
+
+	close(jobs)
+	fmt.Println("All playlist links created. Finishing track uploads...")
+	wg.Wait()
+	fmt.Println("All songs were added to the linked playlists successfully.")
+}
+
+func (s *SpotifyClient) GetNextPlaylist(ctx context.Context, PlaylistID string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf(s.WebConfig.GetPlaylist, PlaylistID), nil)
+	if err != nil {
+		return "", fmt.Errorf("Error while creating request: %s", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+s.Auth.Token.AccessToken)
+
+	query := req.URL.Query()
+	query.Add("fields", "description")
+
+	req.URL.RawQuery = query.Encode()
+
+	resp, err := s.WebConfig.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("Error while requesting: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 300 {
+		var errResp ErrorResponse
+		err = json.NewDecoder(resp.Body).Decode(&errResp)
 		if err != nil {
-			log.Printf("Error reading file: %v\n", err)
-			break
+			return "", fmt.Errorf("Error decoding JSON error: %s", err)
 		}
-		musicsURI := make([]string, n)
+		return "", fmt.Errorf("Error to get playlist description `%s` (%d): %s", PlaylistID, errResp.Error.Status, errResp.Error.Message)
+	}
 
-		for i := 0; i < n; i++ {
-			byte := buf[i]
-			musicsURI[i] = writerdictionary[byte]
+	var description PlaylistInfo
+	err = json.NewDecoder(resp.Body).Decode(&description)
+	if err != nil {
+		return "", fmt.Errorf("Error to decode response: %w", err)
+	}
+
+	if description.Description == "null" {
+		return "", fmt.Errorf("No more playlist, file is complete :)")
+	}
+
+	return description.Description, nil
+}
+
+func (s *SpotifyClient) ReaderWorker(ctx context.Context, jobs <-chan ReadJob, results chan<- ReadResult, readerdictionary map[string]byte) {
+	for j := range jobs {
+		playlistURL := fmt.Sprintf(s.WebConfig.PlaylistURL, j.PlaylistID)
+		var allBytes []byte
+		var nextPlaylistID string
+
+		rateLimitMultiplier := 1
+
+		for {
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, playlistURL, nil)
+			req.Header.Set("Authorization", "Bearer "+s.Auth.Token.AccessToken)
+
+			query := req.URL.Query()
+			query.Add("fields", "next,items(track(uri))")
+			query.Add("limit", "50")
+			req.URL.RawQuery = query.Encode()
+
+			resp, err := s.WebConfig.client.Do(req)
+			if err != nil {
+				log.Printf("Request Error: %v. Trying Again", err)
+				continue
+			}
+
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				if resp.StatusCode == 429 {
+					waitTime := RateLimitWaitTime * rateLimitMultiplier
+					log.Printf("[Worker] Rate Limit on playlist %s. Waiting %d seconds...", j.PlaylistID, waitTime)
+					time.Sleep(time.Duration(waitTime) * time.Second)
+					rateLimitMultiplier++
+					resp.Body.Close()
+					continue
+				}
+
+				if resp.StatusCode == 502 { // Bad Gateway
+					log.Printf("[Worker] Error 502 in playlist %s. Trying again in 1s...", j.PlaylistID)
+					time.Sleep(1 * time.Second)
+					rateLimitMultiplier++
+					resp.Body.Close()
+					continue
+				}
+
+				log.Printf("Fatal error %d playlist %s", resp.StatusCode, j.PlaylistID)
+				resp.Body.Close()
+				break
+			}
+
+			var items PlaylistItems
+			json.NewDecoder(resp.Body).Decode(&items)
+			resp.Body.Close()
+
+			for _, item := range items.Items {
+				if b, ok := readerdictionary[item.Track.Uri]; ok {
+					allBytes = append(allBytes, b)
+				}
+			}
+
+			if items.Next == "" {
+				nextID, _ := s.GetNextPlaylist(ctx, j.PlaylistID)
+				nextPlaylistID = nextID
+				break
+			}
+			playlistURL = items.Next
 		}
 
-		addPlaylistURIS := SpotifyAddPlaylist{
-			MusicURIS: musicsURI,
+		results <- ReadResult{
+			Sequence: j.Sequence,
+			Data:     allBytes,
+			NextID:   nextPlaylistID,
 		}
-
-		err = s.AddToPlaylist(ctx, addPlaylistURIS, playlistID)
-		if err != nil {
-			log.Println(err)
-			return
-		}
-
-		fmt.Printf("Read %d bytes\n", n)
-		bytesRead += n
 	}
 }
 
-func main() {
+func (s *SpotifyClient) Reader(startPlaylistID, filename, password, decoder string) {
+	ctx := context.Background()
+	var readerdictionary map[string]byte
+	var err error
+
+	if decoder == "" {
+		_, readerdictionary, err = s.NewDictionary(ctx, password)
+	} else {
+		readerdictionary, err = loadMap(decoder, password)
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	jobs := make(chan ReadJob, numWorkers)
+	results := make(chan ReadResult, numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		go s.ReaderWorker(ctx, jobs, results, readerdictionary)
+	}
+
+	f, _ := os.OpenFile(filename, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+	defer f.Close()
+
+	pendingResults := make(map[int]ReadResult)
+	nextToWrite := 0
+	currentPlaylistID := startPlaylistID
+	jobsSent := 0
+
+	doneSending := false
+
+	for {
+		if !doneSending && len(jobs) < numWorkers && currentPlaylistID != "" {
+			jobs <- ReadJob{Sequence: jobsSent, PlaylistID: currentPlaylistID}
+
+			currentPlaylistID, _ = s.GetNextPlaylist(ctx, currentPlaylistID)
+			jobsSent++
+			if currentPlaylistID == "" {
+				doneSending = true
+			}
+		}
+
+		select {
+		case res := <-results:
+			pendingResults[res.Sequence] = res
+			for {
+				if nextRes, ok := pendingResults[nextToWrite]; ok {
+					f.Write(nextRes.Data)
+					fmt.Printf("Playlist sequence %d written to the file.\n", nextToWrite)
+					delete(pendingResults, nextToWrite)
+					nextToWrite++
+
+					if doneSending && nextToWrite == jobsSent {
+						fmt.Println("Completed!")
+						return
+					}
+				} else {
+					break
+				}
+			}
+		case <-time.After(time.Second * 10):
+			if doneSending && nextToWrite == jobsSent {
+				return
+			}
+		}
+	}
+}
+
+func StringInput(question string, answer *string, optional bool) {
+	for {
+		fmt.Printf("%s", question)
+		fmt.Scanln(answer)
+		if strings.TrimSpace(*answer) != "" && !optional {
+			fmt.Println("Empty answer... Please try again")
+			continue
+		}
+		break
+	}
+}
+
+func initSpotify() (SpotifyClient, error) {
 	authStruct, err := NewAuthHandler()
 	if err != nil {
 		log.Fatalln(err)
@@ -492,7 +910,6 @@ func main() {
 
 	srv := NewHttpServer(authStruct)
 	go func(srv *http.Server) {
-		fmt.Printf("Server running on port %s...", ServerPort)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Error starting server: %s", err)
 		}
@@ -516,7 +933,7 @@ func main() {
 	}
 
 	if timeout {
-		return
+		return SpotifyClient{}, fmt.Errorf("Server shut down due to inactivity (timeout).")
 	}
 
 	ctx = context.Background()
@@ -528,27 +945,83 @@ func main() {
 
 		// The `%s` prefix is required in both URLs because information such as the user ID is needed for the query.
 		CreatePlaylistURL:     "https://api.spotify.com/v1/users/%s/playlists",
-		AddPlaylistURL:        "https://api.spotify.com/v1/playlists/%s/tracks",
+		PlaylistURL:           "https://api.spotify.com/v1/playlists/%s/tracks",
 		ChangePlaylistDetails: "https://api.spotify.com/v1/playlists/%s",
+		GetPlaylist:           "https://api.spotify.com/v1/playlists/%s",
 	}
 
-	client := &SpotifyClient{
+	client := SpotifyClient{
 		Auth:      authStruct,
 		WebConfig: webConfig,
 	}
 
 	err = client.GetUserID(ctx)
 	if err != nil {
-		log.Println("Cannot get user ID:", err)
+		return SpotifyClient{}, fmt.Errorf("Cannot get user ID: %v", err)
 	}
 
-	log.Println("User ID: ", client.ClientID)
+	return client, nil
+}
 
-	secretKey := "Minha-Chave-Secreta"
-	h := sha256.New()
-	h.Write([]byte(secretKey))
-	hash := h.Sum(nil)
+func main() {
 
-	client.Writer("LICENSE", hash)
+	fmt.Printf(` 
+                                                                                                      
+ @@@@@@   @@@@@@@    @@@@@@   @@@@@@@  @@@  @@@@@@@@  @@@ @@@             @@@@@@@@   @@@@@@   
+@@@@@@@   @@@@@@@@  @@@@@@@@  @@@@@@@  @@@  @@@@@@@@  @@@ @@@             @@@@@@@@  @@@@@@@   
+!@@       @@!  @@@  @@!  @@@    @@!    @@!  @@!       @@! !@@             @@!       !@@       
+!@!       !@!  @!@  !@!  @!@    !@!    !@!  !@!       !@! @!!             !@!       !@!       
+!!@@!!    @!@@!@!   @!@  !@!    @!!    !!@  @!!!:!     !@!@!   @!@!@!@!@  @!!!:!    !!@@!!    
+ !!@!!!   !!@!!!    !@!  !!!    !!!    !!!  !!!!!:      @!!!   !!!@!@!!!  !!!!!:     !!@!!!   
+     !:!  !!:       !!:  !!!    !!:    !!:  !!:         !!:               !!:            !:!  
+    !:!   :!:       :!:  !:!    :!:    :!:  :!:         :!:               :!:           !:!   
+:::: ::    ::       ::::: ::     ::     ::   ::          ::                ::       :::: ::   
+:: : :     :         : :  :      :     :     :           :                 :        :: : :
+
+
+		`)
+
+	var option int
+	for {
+		fmt.Printf("Would you like to:\n1) Write file to Playlist\n2) Read file from Playlist\nAnswer:")
+		fmt.Scanln(&option)
+		if option > 2 {
+			fmt.Println("Invalid option... Try again")
+			continue
+		}
+		break
+	}
+
+	var secretKey string
+	StringInput("Enter password to use as a seed: ", &secretKey, false)
+
+	var filepath string
+	var playlistName string
+	var playlistID string
+	var gobFilePath string
+	switch option {
+	case 1:
+		StringInput("Enter the filepath of the file you would like to store: ", &filepath, false)
+		StringInput("Enter a name for the Playlist: ", &playlistName, false)
+		client, err := initSpotify()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		client.Writer(filepath, secretKey, playlistName)
+
+	case 2:
+		StringInput("Enter playlist ID: ", &playlistID, false)
+		StringInput("Enter a name for the file to be restored, including the extension: ", &filepath, false)
+		StringInput("Path to the decoder file (Optional, but recommended): ", &gobFilePath, true)
+		client, err := initSpotify()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		client.Reader(playlistID, filepath, secretKey, "loremPlaylist_Decoder.gob")
+
+	default:
+	}
 
 }
