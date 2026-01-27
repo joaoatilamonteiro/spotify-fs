@@ -1019,7 +1019,7 @@ func main() {
 			fmt.Println(err)
 			return
 		}
-		client.Reader(playlistID, filepath, secretKey, "loremPlaylist_Decoder.gob")
+		client.Reader(playlistID, filepath, secretKey, gobFilePath)
 
 	default:
 	}
