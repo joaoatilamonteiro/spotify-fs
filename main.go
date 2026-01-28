@@ -893,7 +893,7 @@ func StringInput(question string, answer *string, optional bool) {
 	for {
 		fmt.Printf("%s", question)
 		fmt.Scanln(answer)
-		if strings.TrimSpace(*answer) != "" && !optional {
+		if strings.TrimSpace(*answer) == "" && !optional {
 			fmt.Println("Empty answer... Please try again")
 			continue
 		}
