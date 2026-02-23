@@ -1,3 +1,4 @@
+from mapper import MusicalMapper
 from imports import *
 
 # Carrega configurações
@@ -87,6 +88,43 @@ class SpotifyClient:
             print(f"Search error: {response.status_code}")
             return []
 
+    def create_playlist(self,id_user,name_playlist,description):
+        url_create_playlist = f"https://api.spotify.com/v1/users/{id_user}/playlists"
+
+        payload = {
+            "name": name_playlist,
+            "description": description,
+            "public": False
+        }
+
+        response = self._make_request("POST",url_create_playlist, json = payload)
+
+        if response.status_code == 201:
+            return response.json()["id"]
+        else:
+            print(f"Search error: {response.status_code}")
+            return None
+
+
+    def add_track_playlist(self,id_playlist,track_list):
+        #TODO Montamos o endereço de entrega usando o ID que recebemos
+        url = f"https://api.spotify.com/v1/playlists/{id_playlist}/tracks"
+
+        #TODO Descobrimos o tamanho total do arquivo (quantas músicas tem na lista)
+        size_track_list = len(track_list)
+        #TODO Criamos o loop que pula de 100 em 100
+        for i in range (0, size_track_list, 100):
+        #TODO Fatiamos a lista! (Pega do item atual 'i' até o 'i + 100')
+            pacote = track_list[i: i+100]
+        #TODO Colocamos as 100 músicas no envelope exigido pelo Spotify
+            payload = {"uris": pacote}
+        #TODO Fazemos a entrega (POST)
+            response = self._make_request("POST", url, json=payload)
+            if response.status_code != 201:
+                print(f"Search error: {response.status_code}")
+
+
+
 # Variável global para o servidor local
 captured_code = None
 
@@ -128,12 +166,3 @@ def auto_login(client_id, client_secret, redirect_uri, scopes):
     else:
         print("Failed to capture code.")
         return None
-
-# Bloco de execução principal
-if __name__ == "__main__":
-    token = auto_login(config["id_client"], config["id_client_secret"], config["url_redirecionamento"], SCOPES)
-
-    if token:
-        client = SpotifyClient(token)
-        user_id = client.get_user_id()
-        print(f"Authenticated as: {user_id}")
